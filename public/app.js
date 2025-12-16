@@ -129,7 +129,7 @@ function initBoardsIfNeeded() {
     },
     onDrop: (source, target) => {
       // Always snap back (server authoritative).
-      if (!socket || !currentMatchId) return 'snapback';
+      if (!socket || !currentMatchId || source === target) return 'snapback';
       socket.emit('move_attempt', {
         matchId: currentMatchId,
         boardIndex: idx,

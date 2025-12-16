@@ -241,7 +241,44 @@ io.on('connection', (socket) => {
     socket.emit('queue_status', { status: 'idle' });
   });
 
+/*
   socket.on('move_attempt', (msg) => {
+	  try{
+		const schema = z.object({
+		  matchId: z.string().min(1),
+		  boardIndex: z.number().int().min(1).max(3),
+		  from: z.string().min(2).max(2),
+		  to: z.string().min(2).max(2),
+		  promotion: z.string().optional()
+		});
+		
+		const parsed = schema.safeParse(msg);
+		
+		if (!parsed.success) return;
+
+		const { matchId, boardIndex, from, to, promotion } = parsed.data;
+
+		console.log('MOVE_ATTEMPT 1', { user: user.username, matchId, boardIndex, from, to });
+
+		const match = gameManager.getMatch(matchId);
+		
+		console.log('MOVE_ATTEMPT 2', { user: user.username, matchId, boardIndex, from, to });
+		
+		if (!match || match.endedAt) return;
+
+		if (!gameManager.canMove({ match, socketId: socket.id, boardIndex })) {
+		  socket.emit('move_rejected', { reason: 'not_allowed' });
+	  return;}}
+	  catch (e) {
+		console.error('MOVE_ATTEMPT_HANDLER_FAILED', e);
+		socket.emit('move_rejected', { reason: 'server_error' });
+		}
+	});
+*/
+
+
+  socket.on('move_attempt', (msg) => {
+  try {
     const schema = z.object({
       matchId: z.string().min(1),
       boardIndex: z.number().int().min(1).max(3),
@@ -249,38 +286,34 @@ io.on('connection', (socket) => {
       to: z.string().min(2).max(2),
       promotion: z.string().optional()
     });
-	
+ 
     const parsed = schema.safeParse(msg);
-	
     if (!parsed.success) return;
-
+ 
     const { matchId, boardIndex, from, to, promotion } = parsed.data;
-
-	console.log('MOVE_ATTEMPT 1', { user: user.username, matchId, boardIndex, from, to });
-
+ 
+    console.log('MOVE_ATTEMPT', { user: user.username, matchId, boardIndex, from, to });
+ 
     const match = gameManager.getMatch(matchId);
-	
-	console.log('MOVE_ATTEMPT 2', { user: user.username, matchId, boardIndex, from, to });
-	
     if (!match || match.endedAt) return;
-
+ 
     if (!gameManager.canMove({ match, socketId: socket.id, boardIndex })) {
       socket.emit('move_rejected', { reason: 'not_allowed' });
       return;
     }
-
+ 
     // ensure clock active color matches engine turn
     match.clock.activeColor = match.engine.currentTurn.color;
-
+ 
     const result = match.engine.applyMove({ boardIndex, from, to, promotion: promotion ?? 'q' });
     if (!result.ok) {
       socket.emit('move_rejected', { reason: result.reason });
       return;
     }
-
+ 
     // switch clock to next turn
     match.clock.switchTurn(match.engine.currentTurn.color);
-
+ 
     if (result.matchResult) {
       if (result.matchResult === 'draw') {
         gameManager.finishMatch({ match, result: 'draw', termination: 'checkmate' });
@@ -288,9 +321,13 @@ io.on('connection', (socket) => {
         gameManager.finishMatch({ match, result: result.matchResult, termination: 'checkmate' });
       }
     }
-
+ 
     emitMatchState(match);
-  });
+  } catch (e) {
+    console.error('MOVE_ATTEMPT_HANDLER_FAILED', e);
+    socket.emit('move_rejected', { reason: 'server_error' });
+  }
+});
 
   socket.on('resign', (msg) => {
     const schema = z.object({ matchId: z.string().min(1) });
