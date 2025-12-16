@@ -53,6 +53,11 @@ async function api(path, { method = 'GET', body } = {}) {
 }
 
 function connectSocket() {
+	
+  if (typeof io !== 'function') {
+  throw new Error('Socket.IO client not loaded (io is not defined).');
+  }
+	
   if (socket) socket.disconnect();
   socket = io({ auth: { token } });
 
@@ -75,6 +80,7 @@ function connectSocket() {
   });
 
   socket.on('move_rejected', (msg) => {
+	console.log('move_rejected', msg);
     setStatus(`Move rejected: ${msg.reason}`);
   });
 
@@ -231,7 +237,7 @@ $('registerForm').addEventListener('submit', async (e) => {
     localStorage.setItem('tsc_token', token);
     connectSocket();
   } catch (err) {
-    setAuthError(err?.data?.error || 'Registration failed');
+    setAuthError(err?.data?.error || 'Account created, but realtime failed: …');
   }
 });
 

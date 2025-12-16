@@ -3,12 +3,14 @@ import http from 'http';
 import { Server as SocketIOServer } from 'socket.io';
 import helmet from 'helmet';
 import cors from 'cors';
-import bcrypt from 'bcrypt';
+import bcrypt from 'bcryptjs';
 import { z } from 'zod';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
 import { openDb, makeId, nowMs } from './db/db.js';
 import { signJwt, verifyJwt, getBearerToken } from './auth.js';
-import { Matchmaker } from './game/matchmaking.js';
+import * as matchmakingModule from './game/matchmaking.js';
 import { GameManager } from './game/gameManager.js';
 
 const PORT = Number(process.env.PORT || 3000);
@@ -16,11 +18,18 @@ const DB_PATH = process.env.DB_PATH || './data.sqlite3';
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 
 const app = express();
-app.use(helmet());
+app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors());
 app.use(express.json());
 
 const db = openDb(DB_PATH);
+const Matchmaker =
+  matchmakingModule.Matchmaker ??
+  matchmakingModule.default ??
+  matchmakingModule.default?.Matchmaker;
+if (!Matchmaker) {
+  throw new Error('Failed to load Matchmaker from ./game/matchmaking.js');
+}
 const matchmaker = new Matchmaker();
 const gameManager = new GameManager({ db });
 
@@ -33,24 +42,42 @@ const registerSchema = z.object({
   password: z.string().min(6).max(200)
 });
 
+function bcryptHash(password, saltRounds = 10) {
+  return new Promise((resolve, reject) => {
+    bcrypt.hash(password, saltRounds, (err, hash) => (err ? reject(err) : resolve(hash)));
+  });
+}
+ 
+function bcryptCompare(password, passwordHash) {
+  return new Promise((resolve, reject) => {
+    bcrypt.compare(password, passwordHash, (err, same) => (err ? reject(err) : resolve(same)));
+  });
+}
+
+
 app.post('/api/register', async (req, res) => {
-  const parsed = registerSchema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: 'invalid_request' });
-
-  const { username, password } = parsed.data;
-  const passwordHash = await bcrypt.hash(password, 10);
-
-  const id = makeId('u_');
   try {
-    db.prepare(
-      `INSERT INTO users (id, username, password_hash, rating, created_at) VALUES (?, ?, ?, ?, ?)`
-    ).run(id, username, passwordHash, 1200, nowMs());
+    const parsed = registerSchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'invalid_request' });
+ 
+    const { username, password } = parsed.data;
+    const passwordHash = await bcryptHash(password, 10);
+ 
+    const id = makeId('u_');
+    try {
+      db.prepare(
+        `INSERT INTO users (id, username, password_hash, rating, created_at) VALUES (?, ?, ?, ?, ?)`
+      ).run(id, username, passwordHash, 1200, nowMs());
+    } catch (e) {
+      return res.status(409).json({ error: 'username_taken' });
+    }
+ 
+    const token = signJwt({ userId: id, username }, JWT_SECRET);
+    return res.json({ token, user: { id, username, rating: 1200 } });
   } catch (e) {
-    return res.status(409).json({ error: 'username_taken' });
+    console.error('REGISTER_FAILED', e);
+    return res.status(500).json({ error: 'internal_error' });
   }
-
-  const token = signJwt({ userId: id, username }, JWT_SECRET);
-  res.json({ token, user: { id, username, rating: 1200 } });
 });
 
 const loginSchema = z.object({
@@ -66,7 +93,9 @@ app.post('/api/login', async (req, res) => {
   const user = db.prepare(`SELECT id, username, password_hash, rating FROM users WHERE username = ?`).get(username);
   if (!user) return res.status(401).json({ error: 'invalid_credentials' });
 
-  const ok = await bcrypt.compare(password, user.password_hash);
+  //const ok = await bcrypt.compare(password, user.password_hash);
+  const ok = await bcryptCompare(password, user.password_hash);
+  
   if (!ok) return res.status(401).json({ error: 'invalid_credentials' });
 
   const token = signJwt({ userId: user.id, username: user.username }, JWT_SECRET);
@@ -90,8 +119,24 @@ app.get('/api/me', (req, res) => {
   res.json({ user });
 });
 
-// serve client
-app.use('/', express.static(new URL('../../../public', import.meta.url).pathname));
+// serve client (cross-platform safe path resolution)
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+//const publicDir = path.resolve(__dirname, '..', '..', '..', 'public');
+//const publicDir = path.resolve(__dirname, '..', '..', 'public');
+
+const projectRootDir = path.resolve(__dirname, '..', '..'); // adjust if needed
+const publicDir = path.join(projectRootDir, 'public');
+
+app.use('/img', express.static(path.join(projectRootDir, 'img')));
+
+app.use(express.static(publicDir));
+app.get('/', (req, res) => res.sendFile(path.join(publicDir, 'index.html')));
+
+app.use((err, req, res, next) => {
+  console.error(err);
+  res.status(500).json({ error: 'internal_error' });
+});
 
 const server = http.createServer(app);
 const io = new SocketIOServer(server, {
@@ -204,11 +249,19 @@ io.on('connection', (socket) => {
       to: z.string().min(2).max(2),
       promotion: z.string().optional()
     });
+	
     const parsed = schema.safeParse(msg);
+	
     if (!parsed.success) return;
 
     const { matchId, boardIndex, from, to, promotion } = parsed.data;
+
+	console.log('MOVE_ATTEMPT 1', { user: user.username, matchId, boardIndex, from, to });
+
     const match = gameManager.getMatch(matchId);
+	
+	console.log('MOVE_ATTEMPT 2', { user: user.username, matchId, boardIndex, from, to });
+	
     if (!match || match.endedAt) return;
 
     if (!gameManager.canMove({ match, socketId: socket.id, boardIndex })) {
