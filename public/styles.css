@@ -68,10 +68,10 @@ button.danger { background: var(--danger); color: #120012; }
 .boardWrap { border: 1px solid var(--border); border-radius: 12px; padding: 10px; background: rgba(0,0,0,0.16); }
 .boardTitle { font-weight: 800; margin-bottom: 6px; }
 .turnIndicator { color: var(--muted); font-size: 13px; min-height: 18px; margin-bottom: 6px; }
-.board { width: 360px; }
+.board { width: 306px; }
 .boardWrap.active { outline: 2px solid rgba(106,169,255,0.65); }
 .boardWrap.finished { opacity: 0.7; }
 
 @media (max-width: 980px) {
-  .board { width: 320px; }
+  .board { width: 272px; }
 }
