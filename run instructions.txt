@@ -1,0 +1,5 @@
+cd /workspace/server
+npm install
+node src/index.js
+
+Then open http://localhost:3000 in two browsers (or normal + incognito), register users, queue for Solo or Team.
