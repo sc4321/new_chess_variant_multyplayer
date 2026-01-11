@@ -1,310 +1,594 @@
-let token = localStorage.getItem('tsc_token') || null;
-let socket = null;
+const SUPABASE_URL = window.SUPABASE_URL || '';
+const SUPABASE_ANON_KEY = window.SUPABASE_ANON_KEY || '';
 
-let currentUser = null;
+const supabaseClient  =
+  typeof window.supabase?.createClient === 'function'
+    ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+    : null;
+ 
+window.sb = supabaseClient;
+ 
+let profile = null; // { id, username, rating }
 let currentMatchId = null;
 let currentAssignment = null; // { color, boardRole }
-let latestState = null;
-
+ 
+let engine = null; // TimeShiftEngine
+let clock = null; // MatchClock
+let matchMeta = null; // matches row
+ 
 let boards = { 1: null, 2: null, 3: null };
-
-function $(id) {
+let matchPlayersByUserId = new Map();
+let lastAppliedMoveId = 0;
+ 
+let queueChannel = null;
+let matchMovesChannel = null;
+let matchRowChannel = null;
+ 
+let clockUiTimer = null;
+let timeoutCommitted = false;
+ 
+function el(id) {
   return document.getElementById(id);
 }
-
+ 
 function setVisible(id, visible) {
-  const el = $(id);
-  if (!el) return;
-  el.classList.toggle('hidden', !visible);
+  const node = el(id);
+  if (!node) return;
+  node.classList.toggle('hidden', !visible);
 }
-
+ 
 function fmtMs(ms) {
   const s = Math.max(0, Math.floor(ms / 1000));
   const m = Math.floor(s / 60);
   const r = s % 60;
   return `${String(m).padStart(2, '0')}:${String(r).padStart(2, '0')}`;
 }
-
+ 
 function setStatus(text) {
-  $('gameStatus').textContent = text || '';
+  el('gameStatus').textContent = text || '';
 }
-
+ 
 function setQueueStatus(text) {
-  $('queueStatus').textContent = text || '';
+  el('queueStatus').textContent = text || '';
 }
-
+ 
 function setAuthError(text) {
-  $('authError').textContent = text || '';
+  el('authError').textContent = text || '';
 }
-
-async function api(path, { method = 'GET', body } = {}) {
-  const headers = { 'Content-Type': 'application/json' };
-  if (token) headers.Authorization = `Bearer ${token}`;
-
-  const res = await fetch(path, {
-    method,
-    headers,
-    body: body ? JSON.stringify(body) : undefined
-  });
-
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw Object.assign(new Error('API error'), { status: res.status, data });
-  return data;
+ 
+function usernameToEmail(usernameRaw) {
+  const u = String(usernameRaw || '').trim();
+  if (!u) return '';
+  // NOTE: This is a placeholder to keep your original username+password UI.
+  // In production you likely want real email addresses.
+  return `${u.toLowerCase()}@tsc.local`;
 }
-
-function connectSocket() {
-	
-  if (typeof io !== 'function') {
-  throw new Error('Socket.IO client not loaded (io is not defined).');
+ 
+function requireSupabaseConfigured() {
+  if (!supabase) throw new Error('Supabase client not loaded');
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    throw new Error('Missing Supabase config. Fill public/config.js (SUPABASE_URL, SUPABASE_ANON_KEY).');
   }
-	
-  if (socket) socket.disconnect();
-  socket = io({ auth: { token } });
-
-  socket.on('fatal', (msg) => {
-    setStatus(`Fatal: ${msg?.error || 'unknown'}`);
-  });
-
-  socket.on('hello', (msg) => {
-    currentUser = msg.user;
-    $('me').textContent = `${currentUser.username} (rating ${currentUser.rating})`;
-    setVisible('authCard', false);
-    setVisible('lobbyCard', true);
-    setVisible('gameCard', false);
-  });
-
-  socket.on('queue_status', (msg) => {
-    if (msg.status === 'queued') setQueueStatus(`Queued for ${msg.mode}…`);
-    if (msg.status === 'matched') setQueueStatus(`Match found. Joining…`);
-    if (msg.status === 'idle') setQueueStatus('');
-  });
-
-  socket.on('move_rejected', (msg) => {
-	console.log('move_rejected', msg);
-    setStatus(`Move rejected: ${msg.reason}`);
-  });
-
-  socket.on('match_state', (payload) => {
-    latestState = payload;
-    currentMatchId = payload.matchId;
-    resolveAssignment(payload);
-    renderMatch(payload);
-  });
 }
-
-function resolveAssignment(payload) {
-  if (!currentUser) return;
-  const a = payload.assignments.find((x) => x.userId === currentUser.id);
-  currentAssignment = a ? { color: a.color, boardRole: a.boardRole } : null;
+ 
+async function loadMyProfile() {
+  requireSupabaseConfigured();
+  const { data: userData, error: userErr } = await supabaseClient.auth.getUser();
+  if (userErr) throw userErr;
+  const user = userData.user;
+  if (!user) return null;
+ 
+  const { data: p, error: pErr } = await supabaseClient
+    .from('profiles')
+    .select('id, username, rating')
+    .eq('id', user.id)
+    .single();
+  if (pErr) throw pErr;
+  return p;
 }
-
-function canDragPiece(boardIndex, piece) {
-  if (!latestState || !currentAssignment) return false;
-  if (latestState.endedAt) return false;
-
-  const { board, color } = latestState.engine.currentTurn;
-  if (board !== boardIndex) return false;
-
-  // must be our color
-  if (currentAssignment.color !== color) return false;
-
-  if (latestState.mode === 'team') {
-    if (currentAssignment.boardRole !== boardIndex) return false;
+ 
+async function waitForMyMatch({ timeoutMs = 20000 } = {}) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const { data, error } = await supabaseClient
+      .from('match_players')
+      .select('match_id, created_at')
+      .eq('user_id', profile.id)
+      .order('created_at', { ascending: false })
+      .limit(1);
+ 
+    if (!error && data?.[0]?.match_id) return data[0].match_id;
+    await new Promise((r) => setTimeout(r, 500));
   }
-
-  // piece must match our color
-  const pieceColor = piece?.charAt(0) === 'w' ? 'w' : piece?.charAt(0) === 'b' ? 'b' : null;
-  return pieceColor === color;
+  return null;
 }
-
+ 
+ 
+function clearRealtime() {
+  if (!supabaseClient) return;
+  if (queueChannel) supabaseClient.removeChannel(queueChannel);
+  if (matchMovesChannel) supabaseClient.removeChannel(matchMovesChannel);
+  if (matchRowChannel) supabaseClient.removeChannel(matchRowChannel);
+  queueChannel = null;
+  matchMovesChannel = null;
+  matchRowChannel = null;
+}
+ 
+function stopClockUi() {
+  if (clockUiTimer) clearInterval(clockUiTimer);
+  clockUiTimer = null;
+}
+ 
 function initBoardsIfNeeded() {
   if (boards[1]) return;
-
-  const mk = (idx) => Chessboard(`board${idx}`, {
-    draggable: true,
-    position: 'start',
-    orientation: 'white',
-    onDragStart: (source, piece) => {
-      return canDragPiece(idx, piece);
-    },
-    onDrop: (source, target) => {
-      // Always snap back (server authoritative).
-      if (!socket || !currentMatchId || source === target) return 'snapback';
-      socket.emit('move_attempt', {
-        matchId: currentMatchId,
-        boardIndex: idx,
-        from: source,
-        to: target,
-        promotion: 'q'
-      });
-      return 'snapback';
-    }
-  });
-
+ 
+  const mk = (idx) =>
+    Chessboard(`board${idx}`, {
+      draggable: true,
+      position: 'start',
+      orientation: 'white',
+      onDragStart: (source, piece) => canDragPiece(idx, piece),
+      onDrop: (source, target, piece) => {
+        if (!profile || !currentMatchId || !engine || source === target) return 'snapback';
+        if (!canDragPiece(idx, pieceFromCode(piece))) return 'snapback';
+        submitMove({ boardIndex: idx, from: source, to: target, promotion: 'q' });
+        return 'snapback';
+      }
+    });
+ 
   boards[1] = mk(1);
   boards[2] = mk(2);
   boards[3] = mk(3);
 }
-
-function renderTurnIndicators(engine) {
+ 
+function pieceFromCode(piece) {
+  // chessboard.js gives codes like "wP" (already fine)
+  return piece;
+}
+ 
+function canDragPiece(boardIndex, piece) {
+  if (!engine || !currentAssignment || !matchMeta) return false;
+  if (matchMeta.ended_at) return false;
+ 
+  const { board, color } = engine.currentTurn;
+  if (board !== boardIndex) return false;
+  if (currentAssignment.color !== color) return false;
+ 
+  if (matchMeta.mode === 'team') {
+    if (currentAssignment.boardRole !== boardIndex) return false;
+  }
+ 
+  const pieceColor = piece?.charAt(0) === 'w' ? 'w' : piece?.charAt(0) === 'b' ? 'b' : null;
+  return pieceColor === color;
+}
+ 
+function renderTurnIndicators() {
+  const snapshot = engine.serialize();
+  const boardFinished = snapshot.boardFinished;
+  const boardResults = snapshot.boardResults;
+ 
   for (let i = 1; i <= 3; i++) {
     const wrap = document.querySelector(`#board${i}`).closest('.boardWrap');
-    wrap.classList.toggle('active', engine.currentTurn.board === i && !engine.boardFinished[i]);
-    wrap.classList.toggle('finished', !!engine.boardFinished[i]);
-
-    const ind = $(`turn${i}`);
-    if (engine.boardFinished[i]) {
-      ind.textContent = `Finished (${engine.boardResults[i]} wins)`;
+    wrap.classList.toggle('active', engine.currentTurn.board === i && !boardFinished[i]);
+    wrap.classList.toggle('finished', !!boardFinished[i]);
+ 
+    const ind = el(`turn${i}`);
+    if (boardFinished[i]) {
+      ind.textContent = `Finished (${boardResults[i]} wins)`;
     } else if (engine.currentTurn.board === i) {
-      ind.textContent = `Active: ${engine.currentTurn.color === 'w' ? "White" : "Black"} to move`;
+      ind.textContent = `Active: ${engine.currentTurn.color === 'w' ? 'White' : 'Black'} to move`;
     } else {
       ind.textContent = 'Inactive';
     }
   }
 }
-
-function renderClocks(clock) {
-  const w = clock.remainingMs.w;
-  const b = clock.remainingMs.b;
-  $('clockWhite').textContent = `White: ${fmtMs(w)}`;
-  $('clockBlack').textContent = `Black: ${fmtMs(b)}`;
-
-  $('clockWhite').classList.toggle('active', clock.activeColor === 'w' && clock.running);
-  $('clockBlack').classList.toggle('active', clock.activeColor === 'b' && clock.running);
+ 
+function renderClocks() {
+  if (!clock) return;
+  const snap = clock.snapshot();
+  el('clockWhite').textContent = `White: ${fmtMs(snap.remainingMs.w)}`;
+  el('clockBlack').textContent = `Black: ${fmtMs(snap.remainingMs.b)}`;
+  el('clockWhite').classList.toggle('active', snap.activeColor === 'w' && snap.running);
+  el('clockBlack').classList.toggle('active', snap.activeColor === 'b' && snap.running);
 }
-
-function renderMatch(payload) {
+ 
+function renderMatchHeader() {
+  const roleText =
+    matchMeta.mode === 'solo'
+      ? `${currentAssignment?.color === 'w' ? 'White' : 'Black'} (controls all boards)`
+      : `${currentAssignment?.color === 'w' ? 'White' : 'Black'} – Board ${currentAssignment?.boardRole}`;
+ 
+  el('matchMeta').textContent = `Match ${currentMatchId} · ${matchMeta.mode.toUpperCase()} · ${roleText}`;
+}
+ 
+function renderBoards() {
+  const snapshot = engine.serialize();
+  boards[1].position(snapshot.positions[1], false);
+  boards[2].position(snapshot.positions[2], false);
+  boards[3].position(snapshot.positions[3], false);
+}
+ 
+function renderMatchUi() {
   initBoardsIfNeeded();
-
+ 
+  if (!currentAssignment) return;
+ 
   setVisible('authCard', false);
   setVisible('lobbyCard', false);
   setVisible('gameCard', true);
-
-  const orientation = currentAssignment?.color === 'b' ? 'black' : 'white';
+ 
+  const orientation = currentAssignment && currentAssignment.color === 'b' ? 'black' : 'white';
+  
   boards[1].orientation(orientation);
   boards[2].orientation(orientation);
   boards[3].orientation(orientation);
-
-  boards[1].position(payload.engine.positions[1], false);
-  boards[2].position(payload.engine.positions[2], false);
-  boards[3].position(payload.engine.positions[3], false);
-
-  renderTurnIndicators(payload.engine);
-  renderClocks(payload.clock);
-
-  const roleText = payload.mode === 'solo'
-    ? `${currentAssignment?.color === 'w' ? 'White' : 'Black'} (controls all boards)`
-    : `${currentAssignment?.color === 'w' ? 'White' : 'Black'} – Board ${currentAssignment?.boardRole}`;
-
-  $('matchMeta').textContent = `Match ${payload.matchId} · ${payload.mode.toUpperCase()} · ${roleText}`;
-
-  if (payload.endedAt) {
-    const r = payload.result === 'draw' ? 'Draw' : payload.result === 'w' ? 'White wins' : 'Black wins';
-    setStatus(`Game over: ${r} (${payload.termination})`);
+ 
+  renderBoards();
+  renderTurnIndicators();
+  renderClocks();
+  renderMatchHeader();
+ 
+  if (matchMeta.ended_at) {
+    const r =
+      matchMeta.result === 'draw' ? 'Draw' : matchMeta.result === 'white' ? 'White wins' : 'Black wins';
+    setStatus(`Game over: ${r} (${matchMeta.termination || 'ended'})`);
   } else {
     setStatus('');
   }
 }
-
-function logout() {
-  localStorage.removeItem('tsc_token');
-  token = null;
-  currentUser = null;
+ 
+async function subscribeForQueueMatch() {
+  if (!profile) return;
+  clearRealtime();
+ 
+  queueChannel = supabaseClient
+    .channel(`queue_watch_${profile.id}`)
+    .on(
+      'postgres_changes',
+      {
+        event: 'INSERT',
+        schema: 'public',
+        table: 'match_players',
+        filter: `user_id=eq.${profile.id}`
+      },
+      async (payload) => {
+        const matchId = payload?.new?.match_id;
+        if (!matchId) return;
+        setQueueStatus('Match found. Joining…');
+        await enterMatch(matchId);
+      }
+    )
+    .subscribe();
+}
+ 
+async function enterMatch(matchId) {
+  requireSupabaseConfigured();
+  clearRealtime();
+  stopClockUi();
+ 
+  timeoutCommitted = false;
+  lastAppliedMoveId = 0;
+ 
+  currentMatchId = matchId;
+ 
+  const { data: m, error: mErr } = await supabaseClient.from('matches').select('*').eq('id', matchId).single();
+  if (mErr) throw mErr;
+  matchMeta = m;
+ 
+  const { data: players, error: pErr } = await supabaseClient
+    .from('match_players')
+    .select('user_id, color, board_role')
+    .eq('match_id', matchId);
+  if (pErr) throw pErr;
+ 
+  matchPlayersByUserId = new Map(players.map((p) => [p.user_id, p]));
+  const a = matchPlayersByUserId.get(profile.id);
+  currentAssignment = a ? { color: a.color, boardRole: a.board_role } : null;
+ 
+  engine = new window.TimeShiftEngine();
+  clock = new window.MatchClock({ initialMs: matchMeta.time_control_ms });
+  clock.start();
+ 
+  await replayMoves();
+ 
+  setVisible('authCard', false);
+  setVisible('lobbyCard', false);
+  setVisible('gameCard', true);
+  renderMatchUi();
+ 
+  matchMovesChannel = supabaseClient
+    .channel(`match_moves_${matchId}`)
+    .on(
+      'postgres_changes',
+      { event: 'INSERT', schema: 'public', table: 'match_moves', filter: `match_id=eq.${matchId}` },
+      async (payload) => {
+        const move = payload?.new;
+        if (!move) return;
+        await applyMoveRow(move);
+        renderMatchUi();
+      }
+    )
+    .subscribe();
+ 
+  matchRowChannel = supabaseClient
+    .channel(`match_${matchId}`)
+    .on(
+      'postgres_changes',
+      { event: 'UPDATE', schema: 'public', table: 'matches', filter: `id=eq.${matchId}` },
+      (payload) => {
+        if (!payload?.new) return;
+        matchMeta = payload.new;
+        if (matchMeta.ended_at) clock?.pause();
+        renderMatchUi();
+      }
+    )
+    .subscribe();
+ 
+  clockUiTimer = setInterval(() => {
+    renderClocks();
+    maybeCommitTimeout();
+  }, 250);
+}
+ 
+async function replayMoves() {
+  const { data: moves, error: mvErr } = await supabaseClient
+    .from('match_moves')
+    .select('id, board_index, from_square, to_square, promotion, user_id, created_at')
+    .eq('match_id', currentMatchId)
+    .order('id', { ascending: true });
+  if (mvErr) throw mvErr;
+ 
+  for (const move of moves) {
+    await applyMoveRow(move);
+  }
+}
+ 
+async function applyMoveRow(move) {
+  if (move.id <= lastAppliedMoveId) return;
+  lastAppliedMoveId = move.id;
+ 
+  if (!engine || !clock || !matchMeta) return;
+  if (matchMeta.ended_at) return;
+ 
+  const result = engine.applyMove({
+    boardIndex: move.board_index,
+    from: move.from_square,
+    to: move.to_square,
+    promotion: move.promotion || 'q'
+  });
+ 
+  if (!result.ok) {
+    await fullResync();
+    return;
+  }
+ 
+  clock.switchTurn(engine.currentTurn.color);
+ 
+  if (result.matchResult) {
+    await commitMatchEnd({ result: result.matchResult, termination: 'checkmate' });
+  }
+}
+ 
+async function fullResync() {
+  engine = new window.TimeShiftEngine();
+  clock = new window.MatchClock({ initialMs: matchMeta.time_control_ms });
+  clock.start();
+  lastAppliedMoveId = 0;
+  await replayMoves();
+  renderMatchUi();
+}
+ 
+async function submitMove({ boardIndex, from, to, promotion }) {
+  requireSupabaseConfigured();
+  setStatus('');
+ 
+  const { error } = await supabaseClient.from('match_moves').insert({
+    match_id: currentMatchId,
+    user_id: profile.id,
+    board_index: boardIndex,
+    from_square: from,
+    to_square: to,
+    promotion: promotion || 'q'
+  });
+ 
+  if (error) {
+    setStatus(`Move failed: ${error.message}`);
+    await fullResync();
+  }
+}
+ 
+async function commitMatchEnd({ result, termination }) {
+  if (!currentMatchId || !matchMeta || matchMeta.ended_at) return;
+  const update = {
+    ended_at: new Date().toISOString(),
+    result: result === 'draw' ? 'draw' : result === 'w' ? 'white' : 'black',
+    termination: termination || null
+  };
+  const { error } = await supabaseClient.from('matches').update(update).eq('id', currentMatchId).is('ended_at', null);
+  if (error) {
+    const { data: m } = await supabaseClient.from('matches').select('*').eq('id', currentMatchId).single();
+    if (m) matchMeta = m;
+  } else {
+    matchMeta = { ...matchMeta, ...update };
+  }
+  clock?.pause();
+  renderMatchUi();
+}
+ 
+async function maybeCommitTimeout() {
+  if (!clock || !engine || !matchMeta || matchMeta.ended_at) return;
+  if (timeoutCommitted) return;
+  const flagged = clock.isFlagged();
+  if (!flagged) return;
+  timeoutCommitted = true;
+  const winner = flagged === 'w' ? 'b' : 'w';
+  await commitMatchEnd({ result: winner, termination: 'timeout' });
+}
+ 
+async function leaveQueue() {
+  requireSupabaseConfigured();
+  await supabaseClient.rpc('queue_leave');
+  setQueueStatus('');
+  if (queueChannel) {
+    supabaseClient.removeChannel(queueChannel);
+    queueChannel = null;
+  }
+}
+ 
+async function logout() {
+  clearRealtime();
+  stopClockUi();
   currentMatchId = null;
   currentAssignment = null;
-  latestState = null;
-  if (socket) socket.disconnect();
-  $('me').textContent = '';
+  matchMeta = null;
+  engine = null;
+  clock = null;
+  profile = null;
+  el('me').textContent = '';
   setVisible('authCard', true);
   setVisible('lobbyCard', false);
   setVisible('gameCard', false);
+  if (supabaseClient) await supabaseClient.auth.signOut();
 }
-
-// ----------------------
+ 
 // UI wiring
-// ----------------------
-
-$('registerForm').addEventListener('submit', async (e) => {
+el('registerForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   setAuthError('');
-  const fd = new FormData(e.currentTarget);
   try {
-    const data = await api('/api/register', {
-      method: 'POST',
-      body: { username: fd.get('username'), password: fd.get('password') }
-    });
-    token = data.token;
-    localStorage.setItem('tsc_token', token);
-    connectSocket();
-  } catch (err) {
-    setAuthError(err?.data?.error || 'Account created, but realtime failed: …');
-  }
-});
-
-$('loginForm').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  setAuthError('');
-  const fd = new FormData(e.currentTarget);
-  try {
-    const data = await api('/api/login', {
-      method: 'POST',
-      body: { username: fd.get('username'), password: fd.get('password') }
-    });
-    token = data.token;
-    localStorage.setItem('tsc_token', token);
-    connectSocket();
-  } catch (err) {
-    setAuthError(err?.data?.error || 'Login failed');
-  }
-});
-
-$('queueBtn').addEventListener('click', () => {
-  if (!socket) return;
-  setQueueStatus('');
-  socket.emit('queue_join', {
-    mode: $('modeSelect').value,
-    timeControl: $('timeSelect').value
-  });
-});
-
-$('leaveQueueBtn').addEventListener('click', () => {
-  if (!socket) return;
-  socket.emit('queue_leave');
-});
-
-$('logoutBtn').addEventListener('click', () => logout());
-
-$('resignBtn').addEventListener('click', () => {
-  if (!socket || !currentMatchId) return;
-  socket.emit('resign', { matchId: currentMatchId });
-});
-
-$('backToLobbyBtn').addEventListener('click', () => {
-  setVisible('gameCard', false);
-  setVisible('lobbyCard', true);
-});
-
-// ----------------------
-// Bootstrap
-// ----------------------
-
-(async function boot() {
-  if (!token) {
-    setVisible('authCard', true);
-    setVisible('lobbyCard', false);
-    setVisible('gameCard', false);
-    return;
-  }
-
-  try {
-    const me = await api('/api/me');
-    currentUser = me.user;
-    $('me').textContent = `${currentUser.username} (rating ${currentUser.rating})`;
+    requireSupabaseConfigured();
+    const fd = new FormData(e.currentTarget);
+    const username = String(fd.get('username') || '').trim();
+    const password = String(fd.get('password') || '');
+    const email = usernameToEmail(username);
+    if (!username || !password) throw new Error('missing_fields');
+    const { data, error } = await supabaseClient.auth.signUp({ email, password });
+    if (error) throw error;
+ 
+    const user = data.user || (await supabaseClient.auth.getUser()).data.user;
+    if (!user) throw new Error('signup_needs_confirmation');
+ 
+    const { error: upErr } = await supabaseClient.from('profiles').upsert({ id: user.id, username, rating: 1200 });
+    if (upErr) throw upErr;
+ 
+    profile = await loadMyProfile();
+    el('me').textContent = `${profile.username} (rating ${profile.rating})`;
     setVisible('authCard', false);
     setVisible('lobbyCard', true);
     setVisible('gameCard', false);
-    connectSocket();
+  } catch (err) {
+    setAuthError(err?.message || 'Registration failed');
+  }
+});
+ 
+el('loginForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  setAuthError('');
+  try {
+    requireSupabaseConfigured();
+    const fd = new FormData(e.currentTarget);
+    const username = String(fd.get('username') || '').trim();
+    const password = String(fd.get('password') || '');
+    const email = usernameToEmail(username);
+    const { error } = await supabaseClient.auth.signInWithPassword({ email, password });
+    if (error) throw error;
+ 
+    profile = await loadMyProfile();
+    el('me').textContent = `${profile.username} (rating ${profile.rating})`;
+    setVisible('authCard', false);
+    setVisible('lobbyCard', true);
+    setVisible('gameCard', false);
+  } catch (err) {
+    setAuthError(err?.message || 'Login failed');
+  }
+});
+ 
+el('queueBtn').addEventListener('click', async () => {
+  const btn = el('queueBtn');
+  btn.disabled = true;
+  try {
+    requireSupabaseConfigured();
+    if (!profile) return;
+    setQueueStatus('');
+    await leaveQueue();
+ 
+    const mode = el('modeSelect').value;
+    const timeControlMs = Number(el('timeSelect').value) * 1000;
+ 
+    const { data, error } = await supabaseClient.rpc('queue_join', {
+      mode_in: mode,
+      time_control_ms_in: timeControlMs
+    });
+    if (error) throw error;
+ 
+    const row = Array.isArray(data) ? data[0] : data;
+    if (row?.status === 'matched' && row?.match_id) {
+      await enterMatch(row.match_id);
+      return;
+    }
+ 
+    setQueueStatus(`Queued for ${mode}…`);
+    await subscribeForQueueMatch();
+	const matchId = await waitForMyMatch();
+	if (matchId) await enterMatch(matchId);
+
+  } catch (err) {
+    setQueueStatus(err?.message || 'Queue failed');
+  }
+});
+ 
+el('leaveQueueBtn').addEventListener('click', async () => {
+  try {
+    await leaveQueue();
+  } catch (err) {
+    setQueueStatus(err?.message || 'Leave queue failed');
+  }
+});
+ 
+el('logoutBtn').addEventListener('click', () => logout());
+ 
+el('resignBtn').addEventListener('click', async () => {
+  try {
+    if (!currentMatchId || !currentAssignment) return;
+    const winner = currentAssignment.color === 'w' ? 'b' : 'w';
+    await commitMatchEnd({ result: winner, termination: 'resign' });
+  } catch (err) {
+    setStatus(err?.message || 'Resign failed');
+  }
+});
+ 
+el('backToLobbyBtn').addEventListener('click', async () => {
+  clearRealtime();
+  stopClockUi();
+  currentMatchId = null;
+  currentAssignment = null;
+  engine = null;
+  clock = null;
+  matchMeta = null;
+  setVisible('gameCard', false);
+  setVisible('lobbyCard', true);
+});
+ 
+// Bootstrap
+(async function boot() {
+  setVisible('authCard', true);
+  setVisible('lobbyCard', false);
+  setVisible('gameCard', false);
+ 
+  try {
+    requireSupabaseConfigured();
+  } catch (e) {
+    setAuthError(String(e?.message || e));
+    return;
+  }
+ 
+  try {
+    profile = await loadMyProfile();
+    if (!profile) return;
+    el('me').textContent = `${profile.username} (rating ${profile.rating})`;
+    setVisible('authCard', false);
+    setVisible('lobbyCard', true);
   } catch {
-    logout();
+    // not logged in
   }
 })();
